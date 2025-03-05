@@ -127,6 +127,8 @@ class TelnyxService {
     }
   }
 
+  // Modificaciones al método transferCall en telnyxService.js
+
   async transferCall(callControlId, destinationNumber) {
     const encodedId = encodeURIComponent(callControlId);
     try {
@@ -153,11 +155,31 @@ class TelnyxService {
       console.log(`✅ Transferencia exitosa: ${JSON.stringify(response.data)}`);
       return response.data;
     } catch (error) {
-      console.error(`🚨 TransferCall falló: ${error.response ? JSON.stringify(error.response.data) : error.message}`);
-      throw new Error(`TransferCall falló: ${error.response ? JSON.stringify(error.response.data) : error.message}`);
+      // Manejar errores específicos de la API
+      let errorMessage = 'Error desconocido';
+      
+      if (error.response) {
+        // Error con respuesta del servidor
+        errorMessage = `Error de Telnyx (${error.response.status}): ${JSON.stringify(error.response.data)}`;
+        
+        // Manejar códigos de error específicos
+        if (error.response.status === 422) {
+          errorMessage = `La llamada no se puede transferir porque ya está en otro estado`;
+        } else if (error.response.status === 401 || error.response.status === 403) {
+          errorMessage = `Error de autenticación con la API de Telnyx`;
+        }
+      } else if (error.request) {
+        // Error de conexión
+        errorMessage = `No se pudo conectar con la API de Telnyx: ${error.message}`;
+      } else {
+        errorMessage = `Error en la creación de la solicitud: ${error.message}`;
+      }
+      
+      console.error(`🚨 TransferCall falló: ${errorMessage}`);
+      throw new Error(`TransferCall falló: ${errorMessage}`);
     }
   }
-
+  
   async obtenerExpediente(numeroExp) {
     const cacheKey = `expediente-${numeroExp}`;
     const endpoint = `/api/ConsultaExterna/ObtenerExpedienteBot?numero=${numeroExp}`;

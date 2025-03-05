@@ -39,7 +39,9 @@ const MENSAJES = {
   NO_INFO_UNIDAD: "No se encontró información de la unidad",
   OPCION_INVALIDA: "Opción no válida",
   MENU_CONCLUIDO: "Presione 1 para costos, 2 para datos de unidad, 3 para tiempos, 5 para consultar otro expediente",
-  MENU_EN_PROCESO: "Presione 1 para costos, 2 para datos de unidad, 3 para ubicación, 4 para tiempos, 5 para consultar otro expediente"
+  MENU_EN_PROCESO: "Presione 1 para costos, 2 para datos de unidad, 3 para ubicación, 4 para tiempos, 5 para consultar otro expediente",
+  // Nuevo mensaje de transferencia
+  TRANSFERENCIA: "Expediente no encontrado. Transferiremos su llamada a un agente."
 };
 
 // Inicialización del logger
@@ -61,6 +63,8 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(morgan('dev'));
+
+const transferredCalls = new Set();
 
 // Verificar variables de entorno
 if (!process.env.TELNYX_API_KEY || !process.env.API_BASE_URL) {
@@ -113,11 +117,21 @@ app.post('/webhook', async (req, res) => {
 });
 
 // Manejo de llamada entrante
+// Actualiza la función handleIncomingCall para manejar mejor los errores
+
 async function handleIncomingCall(callControlId, callId, payload) {
   const { from, to } = payload;
   logger.info(`📞 Nueva llamada de ${from} a ${to}`);
 
   try {
+    // Verificar si la llamada es una transferencia (número destino diferente al principal)
+    const esTransferencia = to === process.env.NUMERO_SOPORTE;
+    
+    if (esTransferencia) {
+      logger.info(`⚠️ Llamada ${callId} identificada como transferencia a ${to}. No se procesará automáticamente.`);
+      return; // No procesar automáticamente las llamadas transferidas
+    }
+    
     activeCalls.set(callId, {
       state: 'initiated',
       gatheringDigits: false,
@@ -126,7 +140,19 @@ async function handleIncomingCall(callControlId, callId, payload) {
     });
 
     await delay(DELAYS.ANSWER_CALL);
-    await telnyxService.answerCall(callControlId);
+    
+    try {
+      await telnyxService.answerCall(callControlId);
+    } catch (error) {
+      // Si falla al contestar, verificar si es por un estado incorrecto (422)
+      if (error.response && error.response.status === 422) {
+        logger.warn(`⚠️ No se pudo contestar la llamada ${callId}: ya está en otro estado`);
+        activeCalls.delete(callId);
+        return;
+      }
+      // Para cualquier otro error, relanzarlo
+      throw error;
+    }
 
     await delay(DELAYS.SPEAK_MESSAGE);
     // Mensaje de bienvenida
@@ -147,15 +173,55 @@ async function handleSpeakEnded(callControlId, callId) {
   if (!call) return;
 
   try {
-    activeCalls.set(callId, { ...call, gatheringDigits: true });
-    await telnyxService.gatherDigits(
-      callControlId,
-      null, // Sin instrucción repetida
-      "0123456789#",
-      10
-    );
+    // Verificar si hay una transferencia pendiente específica
+    if (call.transferPending === true) {
+      // Verificar si esta llamada ya fue transferida
+      if (transferredCalls.has(callId)) {
+        logger.info(`⚠️ La llamada ${callId} ya fue transferida previamente, ignorando evento duplicado`);
+        return;
+      }
+      
+      logger.info(`🔊 Mensaje de transferencia completado para ${callId}, procediendo con la transferencia`);
+      
+      // Marcar que ya no está pendiente para evitar transferencias múltiples
+      activeCalls.set(callId, { ...call, transferPending: false });
+      
+      // Pequeña pausa para asegurar que el mensaje se ha reproducido completamente
+      await new Promise(resolve => setTimeout(resolve, 500));
+      
+      // Transferir a número fijo
+      const numeroSoporte = process.env.NUMERO_SOPORTE || "5510112858";
+      
+      try {
+        await telnyxService.transferCall(callControlId, numeroSoporte);
+        // Marcar esta llamada como ya transferida para evitar duplicados
+        transferredCalls.add(callId);
+        logger.info(`✅ Llamada ${callId} transferida exitosamente a ${numeroSoporte}`);
+      } catch (error) {
+        logger.error(`❌ Error al transferir llamada: ${error.message}`);
+        // Si la transferencia falla, terminar la llamada amablemente
+        await telnyxService.speakText(
+          callControlId,
+          "No fue posible transferir su llamada. Por favor, intente más tarde.",
+          VOICE_CONFIG.INFO
+        );
+        setTimeout(() => telnyxService.hangupCall(callControlId), 3000);
+      }
+      return;
+    }
+    
+    // Si no es transferencia, seguir con el flujo normal
+    if (call.etapa !== 'transferencia') {
+      activeCalls.set(callId, { ...call, gatheringDigits: true });
+      await telnyxService.gatherDigits(
+        callControlId,
+        null, // Sin instrucción repetida
+        "0123456789#",
+        10
+      );
+    }
   } catch (error) {
-    logger.error('Error en handleSpeakEnded:', error);
+    logger.error(`Error en handleSpeakEnded: ${error.message}`);
     activeCalls.delete(callId);
   }
 }
@@ -208,31 +274,36 @@ async function handleGatherEnded(callControlId, callId, payload) {
           VOICE_CONFIG.MENU
         );
       } else {
-        // Incrementar intentos y, si es el segundo fallo, transferir la llamada
+        // Incrementar intentos PRIMERO
         call.intentos++;
+        
+        // Luego verificar si es el segundo fallo
         if (call.intentos >= 2) {
+          // Marcar la llamada como en proceso de transferencia
+          activeCalls.set(callId, {
+            ...call,
+            etapa: 'transferencia',
+            gatheringDigits: false,
+            transferPending: true   // Flag para la transferencia
+          });
+          
+          logger.info(`🔄 Iniciando proceso de transferencia para llamada ${callId} (intento ${call.intentos})`);
+          
+          // Reproducir SOLAMENTE el mensaje de transferencia
+          // La transferencia real ocurrirá en handleSpeakEnded cuando el mensaje termine
           await telnyxService.speakText(
             callControlId,
-            "Expediente no encontrado. Transferiremos su llamada.",
+            MENSAJES.TRANSFERENCIA,
             VOICE_CONFIG.INFO
           );
           
-          // Transferir a número fijo con formato correcto
-          const numeroSoporte = process.env.NUMERO_SOPORTE || "5510112858"; // Obtener del .env si está definido
-          
-          try {
-            await telnyxService.transferCall(callControlId, numeroSoporte);
-          } catch (error) {
-            logger.error('Error al transferir llamada:', error);
-            // Si la transferencia falla, terminar la llamada amablemente
-            await telnyxService.speakText(
-              callControlId,
-              "No fue posible transferir su llamada. Por favor, intente más tarde.",
-              VOICE_CONFIG.INFO
-            );
-            setTimeout(() => telnyxService.hangupCall(callControlId), 3000);
-          }
+          // NO hacer nada más aquí - la transferencia será manejada por speak.ended
         } else {
+          // Actualizar el objeto call en el mapa con el nuevo valor de intentos
+          activeCalls.set(callId, { ...call, intentos: call.intentos });
+          
+          logger.info(`⚠️ Expediente no encontrado para ${callId} (intento ${call.intentos} de 2)`);
+          
           await telnyxService.speakText(
             callControlId,
             MENSAJES.REINGRESO_EXPEDIENTE,
@@ -353,7 +424,9 @@ async function procesarOpcionMenu(callControlId, callId, opcion) {
 // Manejo de colgado de llamada
 async function handleCallHangup(callId, payload) {
   logger.info('📞 Llamada finalizada:', { callId, motivo: payload.hangup_cause });
+  // Limpiar las estructuras de datos
   activeCalls.delete(callId);
+  transferredCalls.delete(callId);
 }
 
 // Inicio del servidor
