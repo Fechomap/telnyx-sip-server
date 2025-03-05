@@ -108,6 +108,10 @@ app.post('/webhook', async (req, res) => {
       case 'call.hangup':
         await handleCallHangup(callId, payload);
         break;
+      // Agregar manejo para dtmf.received (para barge-in)
+      case 'call.dtmf.received':
+        await handleDtmfReceived(callControlId, callId, payload);
+        break;
     }
   } catch (error) {
     logger.error('Error manejando evento:', error);
@@ -427,6 +431,105 @@ async function handleCallHangup(callId, payload) {
   // Limpiar las estructuras de datos
   activeCalls.delete(callId);
   transferredCalls.delete(callId);
+}
+
+// 2. Crear la función handleDtmfReceived para manejar el barge-in
+
+async function handleDtmfReceived(callControlId, callId, payload) {
+  const call = activeCalls.get(callId);
+  if (!call) return;
+  
+  // Si ya está recolectando dígitos, no hacer nada
+  if (call.gatheringDigits) return;
+  
+  // Si está en la etapa inicial de bienvenida
+  if (call.etapa === 'esperando_expediente' && !call.bargeInBuffer) {
+    // Iniciar un buffer para acumular dígitos DTMF
+    logger.info(`🎮 Barge-in detectado, iniciando captura de dígitos para ${callId}`);
+    
+    // Detener el mensaje actual si está hablando
+    try {
+      await telnyxService.telnyxApi.post(`/calls/${encodeURIComponent(callControlId)}/actions/stop_speaking`, {
+        command_id: `stop_${Date.now()}`
+      });
+      logger.info(`🔇 Mensaje detenido por barge-in en ${callId}`);
+    } catch (error) {
+      logger.warn(`No se pudo detener el mensaje: ${error.message}`);
+    }
+    
+    // Inicializar el buffer de dígitos con el primer dígito
+    activeCalls.set(callId, {
+      ...call,
+      bargeInBuffer: payload.digit,
+      bargeInTimestamp: Date.now()
+    });
+    
+    // Configurar un timeout para procesar los dígitos después de cierto tiempo sin nuevos dígitos
+    setTimeout(() => procesarBargeIn(callControlId, callId), 3000);
+  } 
+  // Si ya tiene un buffer de barge-in, añadir el nuevo dígito
+  else if (call.bargeInBuffer) {
+    // Si es #, procesar inmediatamente
+    if (payload.digit === '#') {
+      // Añadir # al buffer
+      activeCalls.set(callId, {
+        ...call,
+        bargeInBuffer: call.bargeInBuffer + payload.digit
+      });
+      
+      // Procesar inmediatamente
+      procesarBargeIn(callControlId, callId);
+    } else {
+      // Añadir el dígito al buffer
+      activeCalls.set(callId, {
+        ...call,
+        bargeInBuffer: call.bargeInBuffer + payload.digit,
+        bargeInTimestamp: Date.now()
+      });
+      
+      // Reiniciar el timeout
+      setTimeout(() => procesarBargeIn(callControlId, callId), 3000);
+    }
+  }
+}
+
+// 3. Función para procesar los dígitos acumulados en barge-in
+
+async function procesarBargeIn(callControlId, callId) {
+  const call = activeCalls.get(callId);
+  if (!call || !call.bargeInBuffer) return;
+  
+  // Si pasó demasiado tiempo desde el último dígito, o si hay suficientes dígitos
+  const ahora = Date.now();
+  const tiempoTranscurrido = ahora - call.bargeInTimestamp;
+  
+  // Si han pasado menos de 2 segundos y no hay #, puede que aún haya más dígitos
+  if (tiempoTranscurrido < 2000 && !call.bargeInBuffer.includes('#')) {
+    return;
+  }
+  
+  logger.info(`🎮 Procesando barge-in para ${callId}: ${call.bargeInBuffer}`);
+  
+  // Eliminar # si está presente
+  let digits = call.bargeInBuffer;
+  if (digits.endsWith('#')) {
+    digits = digits.slice(0, -1);
+  }
+  
+  // Limpiar el buffer de barge-in
+  activeCalls.set(callId, {
+    ...call,
+    bargeInBuffer: null,
+    bargeInTimestamp: null
+  });
+  
+  // Crear un payload falso para simular un gather.ended
+  const simulatedPayload = {
+    digits: digits
+  };
+  
+  // Procesar como si fuera un gather.ended normal
+  await handleGatherEnded(callControlId, callId, simulatedPayload);
 }
 
 // Inicio del servidor

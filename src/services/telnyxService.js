@@ -59,7 +59,9 @@ class TelnyxService {
         payload: text,
         voice: voiceConfig.voice,
         language: voiceConfig.language,
-        command_id: `speak_${Date.now()}`
+        command_id: `speak_${Date.now()}`,
+        // Habilitar interrupciones DTMF
+        stop_speaking_on_digit: true  // Esto permite que cualquier dígito detenga el mensaje
       });
     } catch (error) {
       console.error('Error al hablar:', error.message);
