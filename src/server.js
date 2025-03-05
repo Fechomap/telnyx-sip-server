@@ -8,9 +8,9 @@ import { delay } from './utils/helpers.js';
 
 // Constantes para delays
 const DELAYS = {
-  ANSWER_CALL: 1000,
-  SPEAK_MESSAGE: 500,
-  MENU_DELAY: 3000
+  ANSWER_CALL: 200,
+  SPEAK_MESSAGE: 200,
+  MENU_DELAY: 500
 };
 
 // Configuración de voces para diferentes momentos
@@ -38,8 +38,8 @@ const MENSAJES = {
   NO_INFO_COSTOS: "No se encontró información de costos",
   NO_INFO_UNIDAD: "No se encontró información de la unidad",
   OPCION_INVALIDA: "Opción no válida",
-  MENU_CONCLUIDO: "Presione 1 para costos, 2 para datos de unidad, 3 para tiempos",
-  MENU_EN_PROCESO: "Presione 1 para costos, 2 para datos de unidad, 3 para ubicación, 4 para tiempos"
+  MENU_CONCLUIDO: "Presione 1 para costos, 2 para datos de unidad, 3 para tiempos, 5 para consultar otro expediente",
+  MENU_EN_PROCESO: "Presione 1 para costos, 2 para datos de unidad, 3 para ubicación, 4 para tiempos, 5 para consultar otro expediente"
 };
 
 // Inicialización del logger
@@ -112,6 +112,7 @@ app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
 });
 
+// Manejo de llamada entrante
 async function handleIncomingCall(callControlId, callId, payload) {
   const { from, to } = payload;
   logger.info(`📞 Nueva llamada de ${from} a ${to}`);
@@ -120,14 +121,15 @@ async function handleIncomingCall(callControlId, callId, payload) {
     activeCalls.set(callId, {
       state: 'initiated',
       gatheringDigits: false,
-      etapa: 'esperando_expediente'
+      etapa: 'esperando_expediente',
+      intentos: 0
     });
 
     await delay(DELAYS.ANSWER_CALL);
     await telnyxService.answerCall(callControlId);
 
     await delay(DELAYS.SPEAK_MESSAGE);
-    // Usar voz de bienvenida
+    // Mensaje de bienvenida
     await telnyxService.speakText(
       callControlId,
       MENSAJES.BIENVENIDA,
@@ -139,16 +141,16 @@ async function handleIncomingCall(callControlId, callId, payload) {
   }
 }
 
+// Manejo de speak.ended
 async function handleSpeakEnded(callControlId, callId) {
   const call = activeCalls.get(callId);
   if (!call) return;
 
   try {
     activeCalls.set(callId, { ...call, gatheringDigits: true });
-
     await telnyxService.gatherDigits(
       callControlId,
-      null,  // Sin instrucción repetida
+      null, // Sin instrucción repetida
       "0123456789#",
       10
     );
@@ -158,6 +160,7 @@ async function handleSpeakEnded(callControlId, callId) {
   }
 }
 
+// Manejo de gather.ended
 async function handleGatherEnded(callControlId, callId, payload) {
   const call = activeCalls.get(callId);
   if (!call) return;
@@ -166,60 +169,81 @@ async function handleGatherEnded(callControlId, callId, payload) {
   logger.info(`📞 Dígitos recibidos: ${digits}`);
 
   try {
-    switch (call.etapa) {
-      case 'esperando_expediente': {
-        const expedienteData = await telnyxService.obtenerExpediente(digits);
-        if (expedienteData) {
-          activeCalls.set(callId, {
-            ...call,
-            etapa: 'menu_principal',
-            expediente: digits,
-            datosExpediente: expedienteData
-          });
+    if (call.etapa === 'esperando_expediente') {
+      const expedienteData = await telnyxService.obtenerExpediente(digits);
+      if (expedienteData) {
+        // Expediente encontrado: reiniciamos contador y pasamos al menú principal
+        activeCalls.set(callId, {
+          ...call,
+          etapa: 'menu_principal',
+          expediente: digits,
+          datosExpediente: expedienteData,
+          intentos: 0
+        });
 
-          const mensaje = `Expediente encontrado. ${expedienteData.nombre}. ` +
-            `Vehículo: ${expedienteData.vehiculo}. ` +
-            `Estado: ${expedienteData.estatus}. ` +
-            `Servicio: ${expedienteData.servicio}. ` +
-            `Destino: ${expedienteData.destino}. `;
+        const mensaje = `Expediente encontrado. ${expedienteData.nombre}. ` +
+          `Vehículo: ${expedienteData.vehiculo}. ` +
+          `Estado: ${expedienteData.estatus}. ` +
+          `Servicio: ${expedienteData.servicio}. ` +
+          `Destino: ${expedienteData.destino}. `;
 
-          const menuOpciones = expedienteData.estatus === 'Concluido'
-            ? MENSAJES.MENU_CONCLUIDO
-            : MENSAJES.MENU_EN_PROCESO;
+        const menuOpciones = expedienteData.estatus === 'Concluido'
+          ? MENSAJES.MENU_CONCLUIDO
+          : MENSAJES.MENU_EN_PROCESO;
 
-          // Usar voz de información
+        await telnyxService.speakText(
+          callControlId,
+          mensaje,
+          VOICE_CONFIG.INFO
+        );
+
+        await delay(DELAYS.SPEAK_MESSAGE);
+
+        // Presentar menú completo
+        await telnyxService.gatherDigits(
+          callControlId,
+          menuOpciones,
+          expedienteData.estatus === 'Concluido' ? "12345" : "12345",
+          1,
+          VOICE_CONFIG.MENU
+        );
+      } else {
+        // Incrementar intentos y, si es el segundo fallo, transferir la llamada
+        call.intentos++;
+        if (call.intentos >= 2) {
           await telnyxService.speakText(
             callControlId,
-            mensaje,
+            "Expediente no encontrado. Transferiremos su llamada.",
             VOICE_CONFIG.INFO
           );
-
-          await delay(DELAYS.SPEAK_MESSAGE);
-
-          // Usar voz de menú para presentar opciones
-          await telnyxService.gatherDigits(
-            callControlId,
-            menuOpciones,
-            expedienteData.estatus === 'Concluido' ? "123" : "1234",
-            1,
-            VOICE_CONFIG.MENU
-          );
+          
+          // Transferir a número fijo con formato correcto
+          const numeroSoporte = process.env.NUMERO_SOPORTE || "5510112858"; // Obtener del .env si está definido
+          
+          try {
+            await telnyxService.transferCall(callControlId, numeroSoporte);
+          } catch (error) {
+            logger.error('Error al transferir llamada:', error);
+            // Si la transferencia falla, terminar la llamada amablemente
+            await telnyxService.speakText(
+              callControlId,
+              "No fue posible transferir su llamada. Por favor, intente más tarde.",
+              VOICE_CONFIG.INFO
+            );
+            setTimeout(() => telnyxService.hangupCall(callControlId), 3000);
+          }
         } else {
-          // Usar voz de información para error
           await telnyxService.speakText(
             callControlId,
             MENSAJES.REINGRESO_EXPEDIENTE,
             VOICE_CONFIG.INFO
           );
           await delay(DELAYS.SPEAK_MESSAGE);
-          call.etapa = 'esperando_expediente';
           await handleSpeakEnded(callControlId, callId);
         }
-        break;
       }
-      case 'menu_principal':
-        await procesarOpcionMenu(callControlId, callId, digits);
-        break;
+    } else if (call.etapa === 'menu_principal') {
+      await procesarOpcionMenu(callControlId, callId, digits);
     }
   } catch (error) {
     logger.error('Error en handleGatherEnded:', error);
@@ -232,14 +256,14 @@ async function handleGatherEnded(callControlId, callId, payload) {
   }
 }
 
+// Procesamiento de opciones del menú principal
 async function procesarOpcionMenu(callControlId, callId, opcion) {
   const call = activeCalls.get(callId);
   if (!call) return;
+  let respuesta = '';
+  const expediente = call.expediente;
 
   try {
-    let respuesta = '';
-    const expediente = call.expediente;
-
     switch (opcion) {
       case '1': {
         const costos = await telnyxService.obtenerExpedienteCosto(expediente);
@@ -285,17 +309,25 @@ async function procesarOpcionMenu(callControlId, callId, opcion) {
         }
         break;
       }
+      case '5': {
+        // Opción para consultar otro expediente
+        activeCalls.set(callId, { ...call, etapa: 'esperando_expediente', intentos: 0 });
+        await telnyxService.speakText(
+          callControlId,
+          "Por favor, ingrese el nuevo número de expediente.",
+          VOICE_CONFIG.INFO
+        );
+        await delay(DELAYS.SPEAK_MESSAGE);
+        await telnyxService.gatherDigits(callControlId, null, "0123456789#", 10);
+        return;
+      }
       default:
         respuesta = MENSAJES.OPCION_INVALIDA;
     }
 
-    await telnyxService.speakText(
-      callControlId,
-      respuesta,
-      VOICE_CONFIG.INFO
-    );
+    await telnyxService.speakText(callControlId, respuesta, VOICE_CONFIG.INFO);
 
-    // Volver a presentar el menú después de un delay usando voz de menú
+    // Re-presentar el menú principal tras un breve delay
     setTimeout(async () => {
       const menuOpciones = call.datosExpediente.estatus === 'Concluido'
         ? MENSAJES.MENU_CONCLUIDO
@@ -303,7 +335,7 @@ async function procesarOpcionMenu(callControlId, callId, opcion) {
       await telnyxService.gatherDigits(
         callControlId,
         menuOpciones,
-        call.datosExpediente.estatus === 'Concluido' ? "123" : "1234",
+        "0123456789",
         1,
         VOICE_CONFIG.MENU
       );
@@ -318,11 +350,9 @@ async function procesarOpcionMenu(callControlId, callId, opcion) {
   }
 }
 
+// Manejo de colgado de llamada
 async function handleCallHangup(callId, payload) {
-  logger.info('📞 Llamada finalizada:', {
-    callId,
-    motivo: payload.hangup_cause
-  });
+  logger.info('📞 Llamada finalizada:', { callId, motivo: payload.hangup_cause });
   activeCalls.delete(callId);
 }
 
