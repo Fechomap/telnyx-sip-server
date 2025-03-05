@@ -8,16 +8,16 @@ import { delay } from './utils/helpers.js';
 
 // Constantes para delays
 const DELAYS = {
-  ANSWER_CALL: 2000,
-  SPEAK_MESSAGE: 1500,
-  MENU_DELAY: 5000
+  ANSWER_CALL: 1000,
+  SPEAK_MESSAGE: 500,
+  MENU_DELAY: 3000
 };
 
 // Configuración de voces para diferentes momentos
 const VOICE_CONFIG = {
   BIENVENIDA: {
-    voice: "Polly.Lucia-Neural",
-    language: "es-ES"
+    voice: "Polly.Andres-Neural",
+    language: "es-MX"
   },
   MENU: {
     voice: "Polly.Andres-Neural",
