@@ -1,5 +1,7 @@
 import axios from 'axios';
 import AxiosService from './axiosService.js';
+import fetch from 'node-fetch';
+import Telnyx from 'telnyx';
 
 // Definición de voces disponibles
 const VOICES = {
@@ -44,6 +46,10 @@ class TelnyxService {
 
     // Cliente para API de expedientes
     this.apiService = new AxiosService(process.env.API_BASE_URL);
+
+    // Inicialización del caché en memoria
+    // (En producción podrías usar una librería como node-cache o Redis para mayor robustez)
+    this.cache = new Map();
   }
 
   async speakText(callControlId, text, voiceConfig = VOICES.POLLY.MIA_NEURAL) {
@@ -80,8 +86,6 @@ class TelnyxService {
     }
   }
 
-  // ... resto de los métodos permanecen iguales ...
-  
   async answerCall(callControlId) {
     const encodedId = encodeURIComponent(callControlId);
     try {
@@ -105,69 +109,83 @@ class TelnyxService {
     }
   }
 
-  async obtenerExpediente(numeroExp) {
+  // Función genérica para obtener datos desde un endpoint y cachearlos
+  async obtenerDataFromEndpoint(cacheKey, endpoint) {
+    // Si ya existe en caché, retornar inmediatamente
+    if (this.cache.has(cacheKey)) {
+      return this.cache.get(cacheKey);
+    }
     try {
-      const response = await this.apiService.request(
-        'GET',
-        `/api/ConsultaExterna/ObtenerExpedienteBot?numero=${numeroExp}`
-      );
-      return response.dataResponse;
+      const response = await this.apiService.request('GET', endpoint);
+      const data = response.dataResponse;
+      // Almacenar en caché el resultado
+      this.cache.set(cacheKey, data);
+      return data;
     } catch (error) {
-      console.error('Error al obtener expediente:', error);
+      console.error(`Error al obtener datos para ${cacheKey}:`, error);
       return null;
     }
+  }
+
+  async transferCall(callControlId, destinationNumber) {
+    const encodedId = encodeURIComponent(callControlId);
+    try {
+      // Formatear el número en formato E.164 si no comienza con "+"
+      let formattedNumber = destinationNumber;
+      if (!destinationNumber.startsWith('+')) {
+        // Si el número no comienza con 52 (prefijo de México), agregarlo
+        if (!destinationNumber.startsWith('52')) {
+          formattedNumber = `+52${destinationNumber}`;
+        } else {
+          formattedNumber = `+${destinationNumber}`;
+        }
+      }
+      
+      console.log(`🔄 Intentando transferir llamada ${callControlId} a ${formattedNumber}`);
+    
+      // Usar la API REST de Telnyx con el cliente axios
+      const response = await this.telnyxApi.post(`/calls/${encodedId}/actions/transfer`, {
+        to: formattedNumber,
+        from: process.env.TELNYX_FROM_NUMBER,
+        command_id: `transfer_${Date.now()}`
+      });
+    
+      console.log(`✅ Transferencia exitosa: ${JSON.stringify(response.data)}`);
+      return response.data;
+    } catch (error) {
+      console.error(`🚨 TransferCall falló: ${error.response ? JSON.stringify(error.response.data) : error.message}`);
+      throw new Error(`TransferCall falló: ${error.response ? JSON.stringify(error.response.data) : error.message}`);
+    }
+  }
+
+  async obtenerExpediente(numeroExp) {
+    const cacheKey = `expediente-${numeroExp}`;
+    const endpoint = `/api/ConsultaExterna/ObtenerExpedienteBot?numero=${numeroExp}`;
+    return await this.obtenerDataFromEndpoint(cacheKey, endpoint);
   }
 
   async obtenerExpedienteCosto(numeroExp) {
-    try {
-      const response = await this.apiService.request(
-        'GET',
-        `/api/ConsultaExterna/ObtenerExpedienteCostoBot?numero=${numeroExp}`
-      );
-      return response.dataResponse;
-    } catch (error) {
-      console.error('Error al obtener costo:', error);
-      return null;
-    }
+    const cacheKey = `expediente-costo-${numeroExp}`;
+    const endpoint = `/api/ConsultaExterna/ObtenerExpedienteCostoBot?numero=${numeroExp}`;
+    return await this.obtenerDataFromEndpoint(cacheKey, endpoint);
   }
 
   async obtenerExpedienteUnidadOp(numeroExp) {
-    try {
-      const response = await this.apiService.request(
-        'GET',
-        `/api/ConsultaExterna/ObtenerExpedienteUnidadOpBot?numero=${numeroExp}`
-      );
-      return response.dataResponse;
-    } catch (error) {
-      console.error('Error al obtener unidad:', error);
-      return null;
-    }
+    const cacheKey = `expediente-unidad-${numeroExp}`;
+    const endpoint = `/api/ConsultaExterna/ObtenerExpedienteUnidadOpBot?numero=${numeroExp}`;
+    return await this.obtenerDataFromEndpoint(cacheKey, endpoint);
   }
 
   async obtenerExpedienteUbicacion(numeroExp) {
-    try {
-      const response = await this.apiService.request(
-        'GET',
-        `/api/ConsultaExterna/ObtenerExpedienteUbicacionBot?numero=${numeroExp}`
-      );
-      return response.dataResponse;
-    } catch (error) {
-      console.error('Error al obtener ubicación:', error);
-      return null;
-    }
+    const cacheKey = `expediente-ubicacion-${numeroExp}`;
+    const endpoint = `/api/ConsultaExterna/ObtenerExpedienteUbicacionBot?numero=${numeroExp}`;
+    return await this.obtenerDataFromEndpoint(cacheKey, endpoint);
   }
 
   async obtenerExpedienteTiempos(numeroExp) {
-    try {
-      const response = await this.apiService.request(
-        'GET',
-        `/api/ConsultaExterna/ObtenerExpedienteTiemposBot?numero=${numeroExp}`
-      );
-      return response.dataResponse;
-    } catch (error) {
-      console.error('Error al obtener tiempos:', error);
-      return null;
-    }
+    const cacheKey = `expediente-tiempos-${numeroExp}`;
+    const endpoint = `/api/ConsultaExterna/ObtenerExpedienteTiemposBot?numero=${numeroExp}`;
+    return await this.obtenerDataFromEndpoint(cacheKey, endpoint);
   }
 }
 
