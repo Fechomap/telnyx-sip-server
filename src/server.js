@@ -48,9 +48,8 @@ const MENSAJES = {
 
 // Constante para reintentos de transferencia
 const MAX_TRANSFER_ATTEMPTS = 3;
+const MAX_CALL_DURATION = 300000; // 5 minutos en milisegundos
 
-// Constante para inactividad
-const INACTIVITY_TIMEOUT = 30000; // 30 segundos
 
 // Inicialización del logger
 const logger = createLogger({
@@ -72,8 +71,13 @@ app.use(cors());
 app.use(express.json());
 app.use(morgan('dev'));
 
+// Health check endpoint para Kubernetes
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
 const transferredCalls = new Set();
-const inactivityTimeouts = new Map();
+
 
 // Verificar variables de entorno
 if (!process.env.TELNYX_API_KEY || !process.env.API_BASE_URL) {
@@ -85,42 +89,6 @@ if (!process.env.TELNYX_API_KEY || !process.env.API_BASE_URL) {
 const telnyxService = new TelnyxService();
 const activeCalls = new Map();
 
-// Función para reiniciar el timeout de inactividad
-function resetInactivityTimeout(callId, callControlId) {
-  if (inactivityTimeouts.has(callId)) {
-    clearTimeout(inactivityTimeouts.get(callId));
-  }
-  const timeout = setTimeout(() => handleInactivity(callId, callControlId), INACTIVITY_TIMEOUT);
-  inactivityTimeouts.set(callId, timeout);
-  const call = activeCalls.get(callId);
-  if (call) {
-    activeCalls.set(callId, { ...call, lastActivity: Date.now() });
-  }
-}
-
-async function handleInactivity(callId, callControlId) {
-  const call = activeCalls.get(callId);
-  if (!call) return;
-  
-  // Si la llamada está en estado de transferencia, no aplicamos timeout de inactividad
-  if (call.etapa === 'transferencia' || call.transferPending === true) {
-    logger.info(`⏰ Llamada ${callId} en transferencia; se omite timeout por inactividad.`);
-    return;
-  }
-  
-  logger.info(`⏰ Timeout por inactividad para llamada ${callId}`);
-  try {
-    await telnyxService.speakText(
-      callControlId,
-      "No hemos detectado actividad en los últimos 30 segundos. La llamada será finalizada. Gracias por utilizar nuestro servicio.",
-      VOICE_CONFIG.INFO
-    );
-    setTimeout(() => telnyxService.hangupCall(callControlId), 5000);
-    inactivityTimeouts.delete(callId);
-  } catch (error) {
-    logger.error(`Error al manejar inactividad: ${error.message}`);
-  }
-}
 
 // Función de transferencia con reintentos
 async function transferCallWithRetries(callControlId, callId, destinationNumber, attempt = 1) {
@@ -274,6 +242,8 @@ async function handleIncomingCall(callControlId, callId, payload) {
       logger.info(`⚠️ Llamada ${callId} identificada como transferencia a ${to}. No se procesará automáticamente.`);
       return;
     }
+    
+    // Configuración inicial de la llamada
     activeCalls.set(callId, {
       state: 'initiated',
       gatheringDigits: false,
@@ -284,27 +254,45 @@ async function handleIncomingCall(callControlId, callId, payload) {
       consultasPorExpediente: new Map(),
       bargeInBuffer: null,
       bargeInTimestamp: null,
-      lastActivity: Date.now()
+      startTime: Date.now() // Registrar el tiempo de inicio
     });
-    resetInactivityTimeout(callId, callControlId);
+    
+    // Configurar temporizador para finalizar la llamada después de MAX_CALL_DURATION
+    const maxDurationTimeout = setTimeout(() => handleMaxDuration(callControlId, callId), MAX_CALL_DURATION);
+    
+    // Guardar referencia al timeout para poder cancelarlo si la llamada termina antes
+    activeCalls.set(callId, { 
+      ...activeCalls.get(callId), 
+      maxDurationTimeoutId: maxDurationTimeout 
+    });
+    
     await delay(DELAYS.ANSWER_CALL);
+    
     try {
       await telnyxService.answerCall(callControlId);
     } catch (error) {
       if (error.response && error.response.status === 422) {
         logger.warn(`⚠️ No se pudo contestar la llamada ${callId}: ya está en otro estado`);
         activeCalls.delete(callId);
-        inactivityTimeouts.delete(callId);
+        clearTimeout(maxDurationTimeout); // Limpiar el timeout
         return;
       }
       throw error;
     }
+    
+    try {
+      await telnyxService.startNoiseSuppression(callControlId, 'both');
+      logger.info(`✅ Supresión de ruido activada para llamada ${callId}`);
+    } catch (suppressionError) {
+      logger.warn(`⚠️ No se pudo activar la supresión de ruido: ${suppressionError.message}`);
+      // Continuar con la llamada aunque la supresión de ruido falle
+    }
+    
     await delay(DELAYS.SPEAK_MESSAGE);
     await telnyxService.speakText(callControlId, MENSAJES.BIENVENIDA, VOICE_CONFIG.BIENVENIDA);
   } catch (error) {
     logger.error('Error en handleIncomingCall:', error);
     activeCalls.delete(callId);
-    inactivityTimeouts.delete(callId);
   }
 }
 
@@ -330,7 +318,6 @@ async function handleSpeakEnded(callControlId, callId) {
       return;
     }
     if (call.etapa !== 'transferencia') {
-      resetInactivityTimeout(callId, callControlId);
       activeCalls.set(callId, { ...call, gatheringDigits: true });
       await telnyxService.gatherDigits(callControlId, null, "0123456789#", 10);
     }
@@ -343,7 +330,6 @@ async function handleSpeakEnded(callControlId, callId) {
 async function handleGatherEnded(callControlId, callId, payload) {
   const call = activeCalls.get(callId);
   if (!call) return;
-  resetInactivityTimeout(callId, callControlId);
   const digits = payload.digits;
   logger.info(`📞 Dígitos recibidos: ${digits}`);
   try {
@@ -516,19 +502,41 @@ async function procesarOpcionMenu(callControlId, callId, opcion) {
 // Manejo de colgado de llamada
 async function handleCallHangup(callId, payload) {
   logger.info('📞 Llamada finalizada:', { callId, motivo: payload.hangup_cause });
+  
+  // Obtener el callControlId
+  const call = activeCalls.get(callId);
+  if (call) {
+    // Limpiar timeout de hangup si existe
+    if (call.hangupTimeoutId) {
+      clearTimeout(call.hangupTimeoutId);
+    }
+    
+    // Limpiar timeout de duración máxima
+    if (call.maxDurationTimeoutId) {
+      clearTimeout(call.maxDurationTimeoutId);
+    }
+    
+    // Solo intentar detener la supresión si no se marcó como ya detenida
+    if (payload.call_control_id && !call.suppressionStopped) {
+      try {
+        await telnyxService.stopNoiseSuppression(payload.call_control_id);
+        logger.info(`✅ Supresión de ruido desactivada para llamada ${callId}`);
+      } catch (error) {
+        logger.warn(`⚠️ No se pudo desactivar la supresión de ruido: ${error.message}`);
+      }
+    } else if (call.suppressionStopped) {
+      logger.info(`ℹ️ Supresión de ruido ya fue desactivada previamente para llamada ${callId}`);
+    }
+  }
+  
   activeCalls.delete(callId);
   transferredCalls.delete(callId);
-  if (inactivityTimeouts.has(callId)) {
-    clearTimeout(inactivityTimeouts.get(callId));
-    inactivityTimeouts.delete(callId);
-  }
 }
 
 // Manejo de DTMF para barge-in
 async function handleDtmfReceived(callControlId, callId, payload) {
   const call = activeCalls.get(callId);
   if (!call) return;
-  resetInactivityTimeout(callId, callControlId);
   if (call.gatheringDigits) return;
   if (call.etapa === 'esperando_expediente' && !call.bargeInBuffer) {
     logger.info(`🎮 Barge-in detectado, iniciando captura de dígitos para ${callId}`);
@@ -650,6 +658,71 @@ function handleTransferAnswered(callControlId, callId, payload) {
     transferEnCurso: false,
     transferExitosa: true
   });
+}
+
+async function handleMaxDuration(callControlId, callId) {
+  const call = activeCalls.get(callId);
+  if (!call) return;
+  
+  logger.info(`⏰ Duración máxima alcanzada para llamada ${callId}`);
+  
+  try {
+    // Marcar que estamos finalizando por duración máxima
+    activeCalls.set(callId, { 
+      ...call, 
+      finalizandoPorDuracionMaxima: true,
+      gatheringDigits: false // Asegurarse de que no esté en estado de gather
+    });
+    
+    // Detener cualquier gather en curso
+    try {
+      await telnyxService.telnyxApi.post(`/calls/${encodeURIComponent(callControlId)}/actions/gather_stop`, {
+        command_id: `stop_gather_${Date.now()}`
+      });
+      logger.info(`⏹️ Gather detenido para reproducir mensaje de fin de llamada en ${callId}`);
+    } catch (gatherError) {
+      logger.warn(`⚠️ No se pudo detener gather: ${gatherError.message}`);
+      // Continuar aún si falla
+    }
+    
+    // Agregar una pequeña pausa para asegurar que gather se haya detenido
+    await new Promise(resolve => setTimeout(resolve, 500));
+    
+    // Mensaje de finalización por duración máxima
+    logger.info(`🗣️ Reproduciendo mensaje de fin de llamada para ${callId}`);
+    await telnyxService.speakText(
+      callControlId,
+      "Ha alcanzado el tiempo máximo de llamada permitido de 5 minutos. Gracias por utilizar nuestro servicio.",
+      VOICE_CONFIG.INFO
+    );
+    
+    // Esperar a que se complete la reproducción del mensaje (máximo 5 segundos)
+    logger.info(`⏱️ Esperando a que se complete el mensaje de fin de llamada para ${callId}`);
+    await new Promise(resolve => setTimeout(resolve, 5000));
+    
+    // Detener la supresión de ruido antes de colgar
+    try {
+      await telnyxService.stopNoiseSuppression(callControlId);
+      logger.info(`✅ Supresión de ruido desactivada para llamada ${callId}`);
+      
+      // Marcar que la supresión ya fue detenida
+      const callData = activeCalls.get(callId);
+      if (callData) {
+        activeCalls.set(callId, { ...callData, suppressionStopped: true });
+      }
+    } catch (suppressionError) {
+      logger.warn(`⚠️ No se pudo desactivar la supresión de ruido: ${suppressionError.message}`);
+    }
+    
+    // Colgar la llamada
+    logger.info(`📞 Colgando llamada ${callId} por duración máxima`);
+    await telnyxService.hangupCall(callControlId);
+    logger.info(`✅ Llamada ${callId} finalizada exitosamente por duración máxima`);
+  } catch (error) {
+    logger.error(`Error al manejar duración máxima: ${error.message}`);
+    // Intentar colgar de todas formas
+    setTimeout(() => telnyxService.hangupCall(callControlId), 1000);
+  }
 }
 
 // Inicio del servidor

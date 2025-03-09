@@ -211,6 +211,36 @@ class TelnyxService {
     const endpoint = `/api/ConsultaExterna/ObtenerExpedienteTiemposBot?numero=${numeroExp}`;
     return await this.obtenerDataFromEndpoint(cacheKey, endpoint);
   }
+
+  async startNoiseSuppression(callControlId, direction = 'both') {
+    const encodedId = encodeURIComponent(callControlId);
+    try {
+      const response = await this.telnyxApi.post(`/calls/${encodedId}/actions/suppression_start`, {
+        direction: direction, // 'both', 'inbound' o 'outbound'
+        command_id: `suppression_start_${Date.now()}`
+      });
+      console.log(`🔇 Supresión de ruido iniciada para llamada ${callControlId} en dirección ${direction}`);
+      return response.data;
+    } catch (error) {
+      console.error(`Error al iniciar supresión de ruido: ${error.message}`);
+      throw error;
+    }
+  }
+  
+  async stopNoiseSuppression(callControlId) {
+    const encodedId = encodeURIComponent(callControlId);
+    try {
+      const response = await this.telnyxApi.post(`/calls/${encodedId}/actions/suppression_stop`, {
+        command_id: `suppression_stop_${Date.now()}`
+      });
+      console.log(`🔊 Supresión de ruido detenida para llamada ${callControlId}`);
+      return response.data;
+    } catch (error) {
+      console.error(`Error al detener supresión de ruido: ${error.message}`);
+      throw error;
+    }
+  }
+
 }
 
 export default TelnyxService;
