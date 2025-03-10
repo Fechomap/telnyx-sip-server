@@ -1,3 +1,4 @@
+
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -13,18 +14,20 @@ const DELAYS = {
   MENU_DELAY: 500
 };
 
+
+
 // Configuración de voces para diferentes momentos
 const VOICE_CONFIG = {
   BIENVENIDA: {
-    voice: "Polly.Andres-Neural",
+    voice: "Polly.Mia-Neural",
     language: "es-MX"
   },
   MENU: {
-    voice: "Polly.Andres-Neural",
+    voice: "Polly.Mia-Neural",
     language: "es-MX"
   },
   INFO: {
-    voice: "Polly.Andres-Neural",
+    voice: "Polly.Mia-Neural",
     language: "es-MX"
   }
 };
@@ -49,6 +52,7 @@ const MENSAJES = {
 // Constante para reintentos de transferencia
 const MAX_TRANSFER_ATTEMPTS = 3;
 const MAX_CALL_DURATION = 300000; // 5 minutos en milisegundos
+const TRANSFER_TIMEOUT = 20000; 
 
 
 // Inicialización del logger
@@ -71,6 +75,8 @@ app.use(cors());
 app.use(express.json());
 app.use(morgan('dev'));
 
+const transferTracking = new Map();
+
 // Health check endpoint para Kubernetes
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -90,36 +96,46 @@ const telnyxService = new TelnyxService();
 const activeCalls = new Map();
 
 
-// Función de transferencia con reintentos
 async function transferCallWithRetries(callControlId, callId, destinationNumber, attempt = 1) {
+  // Obtener la referencia a la llamada actual
+  const call = activeCalls.get(callId);
+  if (!call) {
+    logger.warn(`⚠️ Llamada ${callId} no encontrada, no se puede transferir`);
+    return false;
+  }
+  
+  // Si ya está marcada como exitosa, no hacer nada
+  if (call.transferExitosa) {
+    logger.info(`ℹ️ La llamada ${callId} ya tiene una transferencia exitosa, ignorando solicitud de reintento`);
+    return true;
+  }
+  
+  // Limpiar timeouts anteriores
+  if (call.transferTimeoutId) {
+    clearTimeout(call.transferTimeoutId);
+    logger.info(`🧹 Limpiado timeout anterior para transferencia de ${callId}`);
+  }
+  
+  // Si ya hay una transferencia en progreso con este intento, no iniciar otra
+  if (call.transferEnCurso && call.transferIntento === attempt) {
+    logger.info(`ℹ️ Transferencia para intento ${attempt} ya en progreso para ${callId}, evitando duplicado`);
+    return true;
+  }
+  
   try {
-    // Obtener la referencia a la llamada actual
-    const call = activeCalls.get(callId);
-    if (!call) return false;
-    
     // Si no es el primer intento, anunciar que vamos a reintentar
     if (attempt > 1) {
-      logger.info(`🗣️ Reproduciendo mensaje de reintento antes del intento ${attempt}`);
+      logger.info(`🗣️ Reproduciendo mensaje de reintento para intento ${attempt}`);
       
       try {
-        // Mensaje de reintento
         await telnyxService.speakText(
           callControlId,
-          "No pudimos contactar a un agente, intentando nuevamente en unos momentos...",
+          `No pudimos contactar a un agente, intentando nuevamente... (intento ${attempt})`,
           VOICE_CONFIG.INFO
         );
         
         // Esperar a que termine de reproducirse el mensaje
-        // Esto es importante para asegurar que el mensaje se escuche completo
-        await new Promise(resolve => {
-          const messageTimeout = setTimeout(resolve, 6000); // 6 segundos para el mensaje
-          
-          // Guardar referencia al timeout para poder cancelarlo si es necesario
-          activeCalls.set(callId, {
-            ...activeCalls.get(callId),
-            messageTimeoutId: messageTimeout
-          });
-        });
+        await new Promise(resolve => setTimeout(resolve, 6000));
         
         logger.info(`✅ Mensaje de reintento reproducido completamente`);
       } catch (messageError) {
@@ -129,10 +145,11 @@ async function transferCallWithRetries(callControlId, callId, destinationNumber,
     }
     
     // Registrar el intento actual
-    logger.info(`🔄 Intento ${attempt} de ${MAX_TRANSFER_ATTEMPTS} para transferir llamada ${callId} a ${destinationNumber}`);
+    logger.info(`🔄 Intento ${attempt} para transferir llamada ${callId} a ${destinationNumber}`);
     
     // Realizar el intento de transferencia
     await telnyxService.transferCall(callControlId, destinationNumber);
+    logger.info(`✅ Solicitud de transferencia enviada para llamada ${callId} (intento ${attempt})`);
     
     // Marcar la llamada como en proceso de transferencia y guardar datos relevantes
     activeCalls.set(callId, {
@@ -141,42 +158,47 @@ async function transferCallWithRetries(callControlId, callId, destinationNumber,
       transferEnCurso: true,
       transferIniciado: Date.now()
     });
-    
-    // Configurar un timeout para el caso en que nadie conteste
-    const timeoutMs = attempt === MAX_TRANSFER_ATTEMPTS ? 30000 : 20000; // Último intento espera un poco más
-    
-    // Esperar a que termine la transferencia (sea contestada o timeout)
-    await new Promise((resolve, reject) => {
-      const transferTimeout = setTimeout(async () => {
-        try {
-          const currentCall = activeCalls.get(callId);
-          if (!currentCall || !currentCall.transferEnCurso) {
-            resolve(false);
-            return;
-          }
-          
-          logger.warn(`⏰ Timeout de transferencia para llamada ${callId} (intento ${attempt})`);
-          
-          if (attempt < MAX_TRANSFER_ATTEMPTS) {
-            // Todavía tenemos más intentos - ir al siguiente
-            const success = await transferCallWithRetries(callControlId, callId, destinationNumber, attempt + 1);
-            resolve(success);
-          } else {
-            // Se agotaron los intentos
-            await handleTransferFailed(callControlId, callId);
-            resolve(false);
-          }
-        } catch (error) {
-          logger.error(`Error en timeout de transferencia: ${error.message}`);
-          reject(error);
-        }
-      }, timeoutMs);
+
+    // Configurar un timeout para verificar si la transferencia tuvo éxito
+    const timeoutId = setTimeout(async () => {
+      // Verificar nuevamente el estado de la llamada
+      const currentCall = activeCalls.get(callId);
       
-      // Guardar referencia al timeout para poder cancelarlo
-      activeCalls.set(callId, {
-        ...activeCalls.get(callId),
-        transferTimeoutId: transferTimeout
-      });
+      // Si la llamada ya no existe, no hacer nada
+      if (!currentCall) {
+        logger.info(`ℹ️ Llamada ${callId} ya no existe, cancelando verificación`);
+        return;
+      }
+      
+      // Si ya está marcada como exitosa, no hacer nada
+      if (currentCall.transferExitosa) {
+        logger.info(`ℹ️ Transferencia para ${callId} ya fue marcada como exitosa, ignorando timeout`);
+        return;
+      }
+      
+      // Si todavía está en transferencia, considerarla como fallida y reintentar
+      if (currentCall.transferEnCurso) {
+        logger.warn(`⏰ Timeout de transferencia para llamada ${callId} (intento ${attempt})`);
+        logger.warn(`⚠️ La transferencia generó un bridge pero no fue contestada`);
+        
+        // Asegurarse de que no haya otro proceso de reintento en curso
+        activeCalls.set(callId, {
+          ...currentCall,
+          transferEnCurso: false,  // Desmarcar como en curso para evitar duplicados
+          transferTimeoutId: null
+        });
+        
+        // Iniciar el siguiente intento (reintentos infinitos)
+        logger.info(`🔄 Iniciando intento ${attempt + 1} para ${callId}`);
+        // Llamada recursiva con intento incrementado
+        await transferCallWithRetries(callControlId, callId, destinationNumber, attempt + 1);
+      }
+    }, 30000); // 30 segundos es suficiente para detectar si hay respuesta después del bridge
+    
+    // Guardar referencia al timeout
+    activeCalls.set(callId, {
+      ...activeCalls.get(callId),
+      transferTimeoutId: timeoutId
     });
     
     return true;
@@ -184,51 +206,191 @@ async function transferCallWithRetries(callControlId, callId, destinationNumber,
     // Error al iniciar la transferencia
     logger.error(`❌ Error en intento ${attempt} de transferencia: ${error.message}`);
     
-    if (attempt < MAX_TRANSFER_ATTEMPTS) {
-      logger.info(`🔄 Pasando al siguiente intento debido a error en API`);
-      return transferCallWithRetries(callControlId, callId, destinationNumber, attempt + 1);
-    } else {
-      await handleTransferFailed(callControlId, callId);
-      return false;
-    }
+    // Programar reintento inmediato
+    logger.info(`🔄 Pasando al siguiente intento debido a error en API`);
+    
+    // Marcar explícitamente que no hay transferencia en curso ahora
+    activeCalls.set(callId, {
+      ...call,
+      transferEnCurso: false
+    });
+    
+    // Breve pausa antes del siguiente intento
+    await new Promise(resolve => setTimeout(resolve, 3000));
+    
+    // Llamada recursiva con intento incrementado
+    return transferCallWithRetries(callControlId, callId, destinationNumber, attempt + 1);
   }
 }
 
-// Handler del Webhook
+// Mejora específica para el caso de call.hangup
 app.post('/webhook', async (req, res) => {
   const event = req.body;
   const eventType = event.event_type || event?.data?.event_type;
   const payload = event.payload || event?.data?.payload;
+  
   if (!eventType || !payload) {
     logger.error('⚠️ Payload del webhook inválido');
     return res.sendStatus(400);
   }
+  
   const callControlId = payload.call_control_id;
   const callId = payload.call_leg_id || callControlId;
+  
   logger.info(`🔔 Webhook: ${eventType} para llamada ${callId}`);
+  
   try {
     switch (eventType) {
       case 'call.initiated':
         await handleIncomingCall(callControlId, callId, payload);
         break;
+        
       case 'call.speak.ended':
         if (!activeCalls.get(callId)?.gatheringDigits) {
           await handleSpeakEnded(callControlId, callId);
         }
         break;
+        
       case 'call.gather.ended':
         await handleGatherEnded(callControlId, callId, payload);
         break;
-      case 'call.hangup':
-        await handleCallHangup(callId, payload);
-        break;
+        
+        case 'call.hangup':
+          // Detectar si esta es una llamada transferida
+          const isTransferredCall = transferTracking.has(callId);
+          
+          if (isTransferredCall) {
+            // Si es una llamada transferida que termina
+            const tracking = transferTracking.get(callId);
+            const originalCallId = tracking.originalCallId;
+            
+            logger.info(`⚠️ Llamada transferida ${callId} finalizó, original: ${originalCallId}, causa: ${payload.hangup_cause}`);
+            
+            // Buscar la llamada original
+            const originalCall = activeCalls.get(originalCallId);
+            
+            if (originalCall && !originalCall.transferExitosa) {
+              // Si la llamada original aún existe y no se ha marcado como transferida exitosamente
+              
+              // Verificar si el hangup fue por timeout u otra causa que indique fallo
+              const failureCauses = ['timeout', 'normal_clearing', 'no_answer', 'busy'];
+              
+              if (failureCauses.includes(payload.hangup_cause)) {
+                logger.warn(`⚠️ Transferencia fallida para ${originalCallId}: ${payload.hangup_cause}`);
+                
+                // Cancelar cualquier timeout pendiente
+                if (originalCall.transferTimeoutId) {
+                  clearTimeout(originalCall.transferTimeoutId);
+                }
+                
+                // Programar reintento con un breve retraso
+                setTimeout(async () => {
+                  try {
+                    // Verificar nuevamente el estado de la llamada
+                    const latestCall = activeCalls.get(originalCallId);
+                    if (!latestCall || latestCall.transferExitosa) {
+                      return;
+                    }
+                    
+                    // Informar al usuario
+                    await telnyxService.speakText(
+                      latestCall.callControlId,
+                      "El agente no ha podido contestar. Intentando nuevamente...",
+                      VOICE_CONFIG.INFO
+                    );
+                    
+                    // Esperar mensaje y reintentar
+                    setTimeout(() => {
+                      const nextAttempt = (latestCall.transferIntento || 0) + 1;
+                      transferCallWithRetries(
+                        latestCall.callControlId,
+                        originalCallId,
+                        process.env.NUMERO_SOPORTE,
+                        nextAttempt
+                      );
+                    }, 3000);
+                  } catch (error) {
+                    logger.error(`❌ Error en reintento: ${error.message}`);
+                    
+                    // Intentar de todas formas
+                    setTimeout(() => {
+                      const finalCall = activeCalls.get(originalCallId);
+                      if (finalCall && !finalCall.transferExitosa) {
+                        const nextAttempt = (finalCall.transferIntento || 0) + 1;
+                        transferCallWithRetries(
+                          finalCall.callControlId,
+                          originalCallId,
+                          process.env.NUMERO_SOPORTE,
+                          nextAttempt
+                        );
+                      }
+                    }, 3000);
+                  }
+                }, 1000);
+              }
+            }
+            
+            // Limpiar el tracking para esta llamada
+            transferTracking.delete(callId);
+          }
+          
+          // Procesar hangup normal
+          await handleCallHangup(callId, payload);
+          break;
+        
       case 'call.dtmf.received':
         await handleDtmfReceived(callControlId, callId, payload);
         break;
+        
+        case 'call.bridged':
+          logger.info(`🔄 Llamada ${callId} bridged con destino: ${payload.to || 'desconocido'}`);
+          
+          // NO marcar como exitosa solo con el bridge
+          // Aquí solo registramos que se estableció un puente, pero esperamos call.answered
+          // antes de marcar la transferencia como exitosa
+          logger.info(`ℹ️ Bridge establecido para ${callId}, esperando contestación...`);
+          break;
+        
+        // En cambio, usamos call.answered para marcar la transferencia como exitosa
+        case 'call.answered':
+          logger.info(`📞 Llamada ${callId} contestada por ${payload.to || 'desconocido'}`);
+          
+          // Si es contestada por el número de soporte, marcar como exitosa
+          if (payload.to === process.env.NUMERO_SOPORTE || 
+              (payload.to && payload.to.includes(process.env.NUMERO_SOPORTE))) {
+            
+            logger.info(`📞 Número de soporte contestó llamada ${callId}`);
+            
+            // Buscar todas las llamadas en curso de transferencia
+            activeCalls.forEach((call, id) => {
+              if (call.transferEnCurso && !call.transferExitosa) {
+                logger.info(`✅ Transferencia exitosa detectada para llamada ${id}`);
+                
+                // Cancelar timeout pendiente
+                if (call.transferTimeoutId) {
+                  clearTimeout(call.transferTimeoutId);
+                }
+                
+                // Marcar como exitosa
+                activeCalls.set(id, {
+                  ...call,
+                  transferEnCurso: false,
+                  transferExitosa: true,
+                  transferTimeoutId: null
+                });
+              }
+            });
+          }
+          break;
+        
+      default:
+        logger.info(`ℹ️ Evento no manejado: ${eventType}`);
     }
   } catch (error) {
-    logger.error('Error manejando evento:', error);
+    logger.error(`❌ Error manejando evento ${eventType}:`, error);
   }
+  
+  // Siempre devolver 200 al webhook
   res.sendStatus(200);
 });
 
@@ -270,6 +432,10 @@ async function handleIncomingCall(callControlId, callId, payload) {
     
     try {
       await telnyxService.answerCall(callControlId);
+      // Solo activar supresión si es necesario
+      if (process.env.ENABLE_NOISE_SUPPRESSION === 'true') {
+        await telnyxService.startNoiseSuppression(callControlId, 'both');
+      }
     } catch (error) {
       if (error.response && error.response.status === 422) {
         logger.warn(`⚠️ No se pudo contestar la llamada ${callId}: ya está en otro estado`);
@@ -296,33 +462,68 @@ async function handleIncomingCall(callControlId, callId, payload) {
   }
 }
 
-// Manejo de speak.ended
+// Función mejorada para manejar el fin de mensajes de transferencia
 async function handleSpeakEnded(callControlId, callId) {
   const call = activeCalls.get(callId);
   if (!call) return;
+  
+  // Si ya está marcada como exitosa, no hacer nada
+  if (call.transferExitosa) {
+    logger.info(`ℹ️ La llamada ${callId} ya tiene una transferencia exitosa, ignorando handleSpeakEnded`);
+    return;
+  }
+  
   try {
-    if (call.transferPending === true) {
-      if (transferredCalls.has(callControlId)) {
-        logger.info(`⚠️ La llamada ${callControlId} ya fue transferida previamente, ignorando evento duplicado`);
-        return;
-      }
-      logger.info(`🔊 Mensaje de transferencia completado para ${callControlId}, procediendo con la transferencia`);
-      activeCalls.set(callId, { ...call, transferPending: false });
+    // Verificar si es un mensaje de transferencia INICIAL (no de reintento)
+    if (call.transferPending && !call.transferIniciada) {
+      logger.info(`🔊 Mensaje de transferencia inicial completado para ${callId}, procediendo con la transferencia`);
       
-      // Aumentar ligeramente esta pausa también
-      await new Promise(resolve => setTimeout(resolve, 1000)); // Incrementado de 500ms a 1000ms
+      // Marcar que ya se inició la transferencia para evitar duplicados
+      activeCalls.set(callId, { 
+        ...call, 
+        transferPending: false,
+        transferIniciada: true 
+      });
       
-      const numeroSoporte = process.env.NUMERO_SOPORTE || "7226001968";
-      // Asegúrate de pasar los tres parámetros en el orden correcto
-      await transferCallWithRetries(callControlId, callId, numeroSoporte);
+      // Pequeña pausa para asegurar que el mensaje se ha reproducido completamente
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      
+      // Iniciar transferencia con reintentos, comenzando con intento 1
+      await transferCallWithRetries(callControlId, callId, process.env.NUMERO_SOPORTE, 1);
       return;
     }
+    
+    // Si es un mensaje de reintento, ignorarlo (el timeout se encargará)
+    if (call.transferIniciada) {
+      logger.info(`ℹ️ Ignorando mensaje de reintento en handleSpeakEnded para ${callId}, el timeout manejará el reintento`);
+      return;
+    }
+    
+    // Si no es transferencia, seguir con el flujo normal de gather
     if (call.etapa !== 'transferencia') {
       activeCalls.set(callId, { ...call, gatheringDigits: true });
-      await telnyxService.gatherDigits(callControlId, null, "0123456789#", 10);
+      await telnyxService.gatherDigits(
+        callControlId, 
+        null, // Sin instrucción repetida
+        "0123456789#", 
+        10
+      );
     }
   } catch (error) {
-    logger.error(`Error en handleSpeakEnded: ${error.message}`);
+    logger.error(`❌ Error en handleSpeakEnded: ${error.message}`);
+    
+    // Intentar recuperar la llamada
+    try {
+      await telnyxService.speakText(
+        callControlId,
+        "Ocurrió un error. Por favor, intente más tarde.",
+        VOICE_CONFIG.INFO
+      );
+      setTimeout(() => telnyxService.hangupCall(callControlId), 5000);
+    } catch (finalError) {
+      logger.error(`❌ Error adicional en handleSpeakEnded: ${finalError.message}`);
+      setTimeout(() => telnyxService.hangupCall(callControlId), 1000);
+    }
   }
 }
 
@@ -384,15 +585,20 @@ async function handleGatherEnded(callControlId, callId, payload) {
           lastActivity: Date.now()
         };
         if (updatedCall.intentos >= 2) {
-          activeCalls.set(callId, {
-            ...updatedCall,
-            etapa: 'transferencia',
-            gatheringDigits: false,
-            transferPending: true
-          });
-          logger.info(`🔄 Iniciando proceso de transferencia para llamada ${callId} (intento ${updatedCall.intentos})`);
-          await telnyxService.speakText(callControlId, MENSAJES.TRANSFERENCIA, VOICE_CONFIG.INFO);
-          // La transferencia se ejecutará en handleSpeakEnded al finalizar el mensaje
+          // Solo iniciar el proceso de transferencia si no se ha iniciado antes
+          if (!call.transferIniciada && !call.transferPending) {
+            activeCalls.set(callId, {
+              ...updatedCall,
+              etapa: 'transferencia',
+              gatheringDigits: false,
+              transferPending: true
+            });
+            logger.info(`🔄 Iniciando proceso de transferencia para llamada ${callId} (intento ${updatedCall.intentos})`);
+            await telnyxService.speakText(callControlId, MENSAJES.TRANSFERENCIA, VOICE_CONFIG.INFO);
+            // La transferencia se ejecutará en handleSpeakEnded al finalizar el mensaje
+          } else {
+            logger.info(`ℹ️ Proceso de transferencia ya iniciado para ${callId}, ignorando solicitud duplicada`);
+          }
         } else {
           activeCalls.set(callId, updatedCall);
           logger.info(`⚠️ Expediente no encontrado para ${callId} (intento ${updatedCall.intentos} de 2)`);
@@ -499,38 +705,32 @@ async function procesarOpcionMenu(callControlId, callId, opcion) {
   }
 }
 
-// Manejo de colgado de llamada
+// Función mejorada para manejar fin de llamada
 async function handleCallHangup(callId, payload) {
-  logger.info('📞 Llamada finalizada:', { callId, motivo: payload.hangup_cause });
-  
-  // Obtener el callControlId
   const call = activeCalls.get(callId);
-  if (call) {
-    // Limpiar timeout de hangup si existe
-    if (call.hangupTimeoutId) {
-      clearTimeout(call.hangupTimeoutId);
-    }
-    
-    // Limpiar timeout de duración máxima
-    if (call.maxDurationTimeoutId) {
-      clearTimeout(call.maxDurationTimeoutId);
-    }
-    
-    // Solo intentar detener la supresión si no se marcó como ya detenida
-    if (payload.call_control_id && !call.suppressionStopped) {
-      try {
-        await telnyxService.stopNoiseSuppression(payload.call_control_id);
-        logger.info(`✅ Supresión de ruido desactivada para llamada ${callId}`);
-      } catch (error) {
-        logger.warn(`⚠️ No se pudo desactivar la supresión de ruido: ${error.message}`);
-      }
-    } else if (call.suppressionStopped) {
-      logger.info(`ℹ️ Supresión de ruido ya fue desactivada previamente para llamada ${callId}`);
-    }
-  }
+  if (!call) return;
   
-  activeCalls.delete(callId);
-  transferredCalls.delete(callId);
+  logger.info(`📞 Llamada ${callId} finalizada: ${payload.hangup_cause || 'motivo desconocido'}`);
+  
+  try {
+    // Limpiar todos los timeouts pendientes
+    if (call.transferTimeoutId) clearTimeout(call.transferTimeoutId);
+    if (call.messageTimeoutId) clearTimeout(call.messageTimeoutId);
+    if (call.maxDurationTimeoutId) clearTimeout(call.maxDurationTimeoutId);
+    
+    // Si la llamada estaba en proceso de transferencia, registrarlo
+    if (call.transferEnCurso && !call.transferExitosa) {
+      logger.info(`📊 Llamada ${callId} finalizada durante transferencia (intento ${call.transferIntento || 1})`);
+    }
+  } catch (error) {
+    logger.error(`❌ Error en handleCallHangup: ${error.message}`);
+  } finally {
+    // Asegurarnos de eliminar la llamada de activeCalls
+    activeCalls.delete(callId);
+    transferredCalls.delete(callId);
+    
+    logger.info('📞 Llamada finalizada correctamente');
+  }
 }
 
 // Manejo de DTMF para barge-in
@@ -594,46 +794,43 @@ async function procesarBargeIn(callControlId, callId) {
   await handleGatherEnded(callControlId, callId, simulatedPayload);
 }
 
-// Función para manejar cuando todos los intentos de transferencia fallan
 async function handleTransferFailed(callControlId, callId) {
+  const call = activeCalls.get(callId);
+  if (!call) return;
+  
+  logger.info(`📞 Se ha decidido finalizar la llamada ${callId} tras varios intentos de transferencia`);
+  
   try {
-    const call = activeCalls.get(callId);
-    if (!call) return;
-    
-    // Limpiar los timeouts
+    // Limpiar timeout de transferencia
     if (call.transferTimeoutId) {
       clearTimeout(call.transferTimeoutId);
     }
-    if (call.messageTimeoutId) {
-      clearTimeout(call.messageTimeoutId);
-    }
     
-    // Marcar la transferencia como fallida
-    activeCalls.set(callId, {
-      ...call,
-      transferEnCurso: false,
-      transferFallida: true
-    });
-    
-    logger.info(`❌ Todos los intentos de transferencia fallaron para ${callId}`);
-    
-    // Mensaje final más claro y detallado
+    // Informar al usuario del problema
     await telnyxService.speakText(
       callControlId,
-      "Lo sentimos, no pudimos contactar a un agente después de varios intentos. Por favor, intente llamar más tarde. Gracias por su paciencia.",
+      "No fue posible transferir su llamada después de varios intentos. Por favor, intente más tarde.",
       VOICE_CONFIG.INFO
     );
     
-    // Esperar a que termine el mensaje antes de colgar
-    await new Promise(resolve => setTimeout(resolve, 10000)); // 10 segundos
+    // Esperar a que termine el mensaje
+    await new Promise(resolve => setTimeout(resolve, 5000));
     
-    // Colgar la llamada
-    logger.info(`📞 Colgando llamada ${callId} después de intentos fallidos de transferencia`);
+    // Forzar colgado de la llamada
     await telnyxService.hangupCall(callControlId);
+    logger.info(`📞 Llamada ${callId} finalizada tras informar al usuario`);
   } catch (error) {
-    logger.error(`Error al manejar fallo de transferencia: ${error.message}`);
-    // Intentar colgar de todas formas
-    setTimeout(() => telnyxService.hangupCall(callControlId), 3000);
+    logger.error(`❌ Error al finalizar llamada ${callId}: ${error.message}`);
+    
+    // Intentar colgar directamente
+    try {
+      telnyxService.hangupCall(callControlId);
+    } catch (finalError) {
+      logger.error(`❌ Error final al intentar colgar ${callId}: ${finalError.message}`);
+    }
+  } finally {
+    // Asegurarnos de eliminar la llamada de activeCalls
+    activeCalls.delete(callId);
   }
 }
 
@@ -725,6 +922,33 @@ async function handleMaxDuration(callControlId, callId) {
   }
 }
 
+async function realizarIntentoTransferencia(callControlId, callId, destinationNumber, intento) {
+  try {
+    logger.info(`🚀 Intento ${intento} de transferencia para ${callId}`);
+    await telnyxService.transferCall(callControlId, destinationNumber);
+
+    // Timeout de 30 segundos para la transferencia
+    const transferExitosa = await new Promise((resolve) => {
+      const timeout = setTimeout(() => resolve(false), 30000);
+      
+      // Escuchar evento de respuesta
+      const handleTransferAnswer = (answeredCallId) => {
+        if (answeredCallId === callId) {
+          clearTimeout(timeout);
+          resolve(true);
+          globalEventEmitter.removeListener('call.answered', handleTransferAnswer);
+        }
+      };
+      globalEventEmitter.on('call.answered', handleTransferAnswer);
+    });
+
+    return transferExitosa;
+  } catch (error) {
+    logger.error(`❌ Error en intento ${intento}:`, error);
+    return false;
+  }
+}
+
 // Inicio del servidor
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
@@ -732,3 +956,4 @@ app.listen(PORT, () => {
 });
 
 export default app;//OK
+
