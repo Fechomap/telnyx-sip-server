@@ -42,17 +42,17 @@ jobs:
           name: telnyx-sip-secrets
         type: Opaque
         stringData:
-          TELNYX_API_KEY: ${{ secrets.TELNYX_API_KEY }}
-          TELNYX_CONNECTION_ID: ${{ secrets.TELNYX_CONNECTION_ID }}
-          TELNYX_FROM_NUMBER: ${{ secrets.TELNYX_FROM_NUMBER }}
-          TELNYX_VOICE_APP_ID: ${{ secrets.TELNYX_VOICE_APP_ID }}
-          TELNYX_OUTBOUND_PROFILE: ${{ secrets.TELNYX_OUTBOUND_PROFILE }}
-          SIP_USERNAME: ${{ secrets.SIP_USERNAME }}
-          SIP_PASSWORD: ${{ secrets.SIP_PASSWORD }}
-          SIP_SERVER: ${{ secrets.SIP_SERVER }}
-          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
-          NUMERO_SOPORTE: ${{ secrets.NUMERO_SOPORTE }}
-          API_BASE_URL: ${{ secrets.API_BASE_URL }}
+          TELNYX_API_KEY: "${{ secrets.TELNYX_API_KEY }}"
+          TELNYX_CONNECTION_ID: "${{ secrets.TELNYX_CONNECTION_ID }}"
+          TELNYX_FROM_NUMBER: "${{ secrets.TELNYX_FROM_NUMBER }}"
+          TELNYX_VOICE_APP_ID: "${{ secrets.TELNYX_VOICE_APP_ID }}"
+          TELNYX_OUTBOUND_PROFILE: "${{ secrets.TELNYX_OUTBOUND_PROFILE }}"
+          SIP_USERNAME: "${{ secrets.SIP_USERNAME }}"
+          SIP_PASSWORD: "${{ secrets.SIP_PASSWORD }}"
+          SIP_SERVER: "${{ secrets.SIP_SERVER }}"
+          WEBHOOK_URL: "${{ secrets.WEBHOOK_URL }}"
+          NUMERO_SOPORTE: "${{ secrets.NUMERO_SOPORTE }}"
+          API_BASE_URL: "${{ secrets.API_BASE_URL }}"
         EOF
         kubectl apply -f secret.yaml
         rm secret.yaml
