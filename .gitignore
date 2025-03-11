@@ -3,6 +3,8 @@ node_modules/
 npm-debug.log
 yarn-debug.log
 yarn-error.log
+package-lock.json
+yarn.lock
 
 # Environment variables
 .env
@@ -14,6 +16,7 @@ yarn-error.log
 # Logs
 logs/
 *.log
+error.log
 
 # Build output
 dist/
@@ -21,6 +24,10 @@ build/
 
 # Docker
 .dockerignore
+
+# Kubernetes secrets
+secret.yaml
+*-secret.yaml
 
 # Azure
 .azure/
@@ -34,12 +41,19 @@ terraform.tfstate.backup
 # Operating System Files
 .DS_Store
 Thumbs.db
+*.tmp
+*.bak
+*.swp
 
 # IDE
 .idea/
 .vscode/
 *.swp
 *.swo
+.project
+.classpath
+.settings/
 
 # Application specific
-error.log
+coverage/
+.nyc_output/
