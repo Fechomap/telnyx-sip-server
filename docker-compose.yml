@@ -1,0 +1,16 @@
+version: '3'
+
+services:
+  telephony-service:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - NODE_ENV=production
+      - TELNYX_API_KEY=${TELNYX_API_KEY}
+      - TELNYX_CONNECTION_ID=${TELNYX_CONNECTION_ID}
+      - TELNYX_FROM_NUMBER=${TELNYX_FROM_NUMBER}
+      - API_BASE_URL=${API_BASE_URL}
+      - NUMERO_SOPORTE=${NUMERO_SOPORTE}
+    restart: always

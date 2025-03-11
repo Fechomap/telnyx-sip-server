@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: telnyx-sip-server
+  labels:
+    app: telnyx-sip
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: telnyx-sip
+  template:
+    metadata:
+      labels:
+        app: telnyx-sip
+    spec:
+      # Ya que usarás una imagen pública de Docker Hub, puedes quitar esta sección
+      # imagePullSecrets:
+      # - name: acr-auth
+      containers:
+      - name: telnyx-sip-server
+        image: ferchomap/telnyx-sip-server:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 3000
+        env:
+        - name: PORT
+          value: "3000"
+        - name: NODE_ENV
+          value: "production"
+        - name: TELNYX_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: telnyx-sip-secrets
+              key: TELNYX_API_KEY
+        - name: TELNYX_CONNECTION_ID
+          valueFrom:
+            secretKeyRef:
+              name: telnyx-sip-secrets
+              key: TELNYX_CONNECTION_ID
+        - name: TELNYX_FROM_NUMBER
+          valueFrom:
+            secretKeyRef:
+              name: telnyx-sip-secrets
+              key: TELNYX_FROM_NUMBER
+        - name: API_BASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: telnyx-sip-secrets
+              key: API_BASE_URL
+        - name: NUMERO_SOPORTE
+          valueFrom:
+            secretKeyRef:
+              name: telnyx-sip-secrets
+              key: NUMERO_SOPORTE
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          initialDelaySeconds: 30
+          periodSeconds: 60
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "300m"
+            memory: "256Mi"
